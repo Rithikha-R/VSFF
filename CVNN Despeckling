@@ -1,0 +1,188 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow.keras.layers import Input, Conv2D, ReLU, BatchNormalization
+from tensorflow.keras.models import Model
+import os
+from skimage.util import random_noise
+import shutil
+
+# Constants
+INPUT_SIZE = (64, 64)
+BS = 16
+ROOT_DIR = "/kaggle/"
+DATASET = os.path.join(ROOT_DIR, 'input/sentinel12-image-pairs-segregated-by-terrain/v_2')
+DATA_GEN_INPUT = os.path.join(ROOT_DIR, 'DATASET')
+
+# Setup data directory
+if os.path.exists(DATA_GEN_INPUT):
+    shutil.rmtree(DATA_GEN_INPUT)
+os.mkdir(DATA_GEN_INPUT)
+
+src = os.path.join(DATASET, "agri/s2")
+dst = os.path.join(DATA_GEN_INPUT, "DATA")
+os.symlink(src, dst)
+
+# Preprocessing function
+def preprocessing_function(img):
+    return np.float32(img / 127.5 - 1)
+
+# Data generator
+generator = tf.keras.preprocessing.image.ImageDataGenerator(preprocessing_function=preprocessing_function)
+train_generator = generator.flow_from_directory(
+    DATA_GEN_INPUT,
+    target_size=INPUT_SIZE,
+    class_mode=None,
+    color_mode='grayscale',
+    batch_size=BS,
+    follow_links=True,
+)
+
+# Display example image
+plt.figure(figsize=(5, 5))
+plt.imshow(next(train_generator)[0], cmap='gray')
+plt.colorbar()
+plt.show()
+
+# Complex-Valued Layers
+class ComplexConv2D(tf.keras.layers.Layer):
+    def __init__(self, filters, kernel_size, padding='same'):
+        super(ComplexConv2D, self).__init__()
+        self.real_conv = Conv2D(filters, kernel_size, padding=padding)
+        self.imag_conv = Conv2D(filters, kernel_size, padding=padding)
+
+    def call(self, inputs):
+        real, imag = tf.split(inputs, 2, axis=-1)
+        real_out = self.real_conv(real) - self.imag_conv(imag)
+        imag_out = self.imag_conv(real) + self.real_conv(imag)
+        return tf.concat([real_out, imag_out], axis=-1)
+
+class ComplexReLU(tf.keras.layers.Layer):
+    def call(self, inputs):
+        real, imag = tf.split(inputs, 2, axis=-1)
+        real_out = tf.nn.relu(real)
+        imag_out = tf.nn.relu(imag)
+        return tf.concat([real_out, imag_out], axis=-1)
+
+class ComplexBatchNormalization(tf.keras.layers.Layer):
+    def __init__(self):
+        super(ComplexBatchNormalization, self).__init__()
+        self.real_bn = BatchNormalization()
+        self.imag_bn = BatchNormalization()
+
+    def call(self, inputs):
+        real, imag = tf.split(inputs, 2, axis=-1)
+        real_out = self.real_bn(real)
+        imag_out = self.imag_bn(imag)
+        return tf.concat([real_out, imag_out], axis=-1)
+
+# Complex-Valued Model
+def create_complex_model(input_shape=(64, 64, 2)):
+    input_layer = Input(shape=input_shape)
+    x = ComplexConv2D(filters=64, kernel_size=(3, 3))(input_layer)
+    x = ComplexReLU()(x)
+
+    for _ in range(4):
+        x = ComplexConv2D(filters=64, kernel_size=(3, 3), padding='same')(x)
+        x = ComplexBatchNormalization()(x)
+        x = ComplexReLU()(x)
+
+    x = ComplexConv2D(filters=2, kernel_size=(3, 3), padding='same')(x)
+    x = ComplexReLU()(x)
+
+    return Model(inputs=input_layer, outputs=x)
+
+# Instantiate the model
+complex_input_shape = list(INPUT_SIZE) + [2]
+model = create_complex_model(complex_input_shape)
+
+model.summary()
+
+# Loss function
+MSE = tf.keras.losses.MeanSquaredError()
+
+def loss_fn(y_true, y_pred, l_tv=0.0002):
+    mse = MSE(y_true, y_pred)
+    variational_loss = tf.image.total_variation(y_pred)
+    total_loss = mse + l_tv * variational_loss
+    return total_loss
+
+# Optimizer
+opt = tf.keras.optimizers.Adam()
+
+# Training step
+@tf.function
+def step(noisy_data, clean_data):
+    with tf.GradientTape() as tape:
+        pred = model(noisy_data, training=True)
+        loss = loss_fn(clean_data, pred)
+    grads = tape.gradient(loss, model.trainable_weights)
+    opt.apply_gradients(zip(grads, model.trainable_weights))
+    return loss
+
+# Training the Model for 50 Epochs
+EPOCHS = 50
+STEPS_PER_EPOCH = len(train_generator)  # Number of steps per epoch based on the generator
+
+# Placeholder to track losses
+loss_history = []
+
+for epoch in range(EPOCHS):
+    epoch_loss = 0
+    for step in range(STEPS_PER_EPOCH):
+        # Get a batch of clean data from the generator
+        clean_data = next(train_generator)
+        
+        # Simulate speckle noise to create noisy input
+        noise_var = np.random.rand() * 0.25
+        noisy_data = random_noise(clean_data, mode='speckle', var=noise_var, clip=True)
+        
+        # Stack real and imaginary parts to match the model's input shape
+        noisy_data = np.concatenate([noisy_data, noisy_data], axis=-1)
+        
+        # Perform a single training step
+        loss = step(noisy_data, clean_data)
+        epoch_loss += loss.numpy()
+    
+    # Average loss for the epoch
+    epoch_loss /= STEPS_PER_EPOCH
+    loss_history.append(epoch_loss)
+    
+    # Print epoch progress
+    print(f"Epoch {epoch + 1}/{EPOCHS} - Loss: {epoch_loss:.4f}")
+
+# Plotting Loss History
+plt.figure(figsize=(10, 5))
+plt.plot(range(1, EPOCHS + 1), loss_history, marker='o', label="Loss")
+plt.xlabel("Epochs")
+plt.ylabel("Loss")
+plt.title("Training Loss Curve")
+plt.legend()
+plt.show()
+
+# Testing the Model
+def test_model(data_generator):
+    img1, img2 = next(data_generator)[:2]
+    noise_var = np.random.rand() * 0.25
+    noisy_img1 = random_noise(img1, mode='speckle', var=noise_var, clip=True)
+    noisy_img2 = random_noise(img2, mode='speckle', var=noise_var, clip=True)
+    
+    # Stack real and imaginary parts to match the input shape expected by the model
+    noisy_img1 = np.concatenate([noisy_img1, noisy_img1], axis=-1)
+    noisy_img2 = np.concatenate([noisy_img2, noisy_img2], axis=-1)
+    noisy_img1 = np.expand_dims(noisy_img1, axis=0)
+    noisy_img2 = np.expand_dims(noisy_img2, axis=0)
+    
+    denoised_img1 = model.predict(noisy_img1)
+    denoised_img2 = model.predict(noisy_img2)
+    
+    fig, ax = plt.subplots(3, 2, figsize=(10, 12))
+    ax[0, 0].imshow(img1[..., 0], cmap='gray')
+    ax[0, 1].imshow(img2[..., 0], cmap='gray')
+    ax[1, 0].imshow(noisy_img1[0][..., 0], cmap='gray')
+    ax[1, 1].imshow(noisy_img2[0][..., 0], cmap='gray')
+    ax[2, 0].imshow(denoised_img1[0][..., 0], cmap='gray')
+    ax[2, 1].imshow(denoised_img2[0][..., 0], cmap='gray')
+    plt.show()
+
+test_model(train_generator)
